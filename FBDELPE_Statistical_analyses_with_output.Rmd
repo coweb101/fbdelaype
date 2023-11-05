@@ -1,0 +1,1969 @@
+---
+title: "FBDELPE: Statistical Analysis with Output"
+author: "Constanze Weber, Christian Bellebaum"
+date: "08/2023"
+output: 
+  html_document:
+    theme: cerulean
+    toc: true
+    toc_float: true
+    code_folding: hide
+    number_sections: true
+---
+
+```{r echo=FALSE, include=FALSE}
+options(width=500, scipen=6, digits=8)
+
+# to display more digit when using probe_interactions:
+options("jtools-digits" = 3)
+
+# for data wrangling
+library(dplyr)
+library(plyr)
+library(reshape2)
+library(tidyr)
+
+# for statistical tests
+library(rstatix)
+library(lme4)
+library(lmerTest)
+library(buildmer)
+library(coin) # for wilcoxon signed rank test
+
+# for plots
+library(ggeffects)
+library(ggplot2)
+library("RColorBrewer")
+library(viridis)
+
+
+```
+
+<style type="text/css">
+  body{
+  font-size: 12pt;
+}
+</style>
+
+This file documents stastical analyses reported in the manuscript **Prediction-error-dependent processing of immediate and delayed positive feedback**. The sample comprises 20 subjects; each subject underwent a total of 600 trials of the probabilistic learning task (300 with immediate, and 300 with delayed feedback presentation in separate runs) while EEG was recorded. 
+
+R version 4.0.3 (2020-10-10), running under Windows 10 x64 (build 19044), was used to generate this document.
+
+# Learning Performance
+
+## Aggregate behavioural data to analyze accuracy
+
+``` {r}
+behav <- read.csv("data/behav_clean.csv", sep=",", header=T)
+
+# add column indicating blocks
+behav$block <- rep(rep(c(1,2,3), each=100), times=(nrow(behav)/300))
+ 
+# add column with ids
+behav$id <- substr(behav$filename, 1, 6)
+
+# check whether performance was below chance based on binomial distribution
+learnerlist <- data.frame() # create empty data frame
+
+# loop through all separate behavioural datafiles:
+for (i in 1:length(unique(behav$filename))){
+  
+  # file currently evaluated:
+  file <- unique(behav$filename)[i]
+  # total number of trials with responses in current file:
+  size <- sum(!is.na(behav$V6[which(behav$filename==file)]))
+  # number of trials with correct responses in current file:
+  n_correct <- sum(behav$V6[which(behav$filename==file)], na.rm=T)
+  
+  # minimum of correct responses (of total number of trials of current data (defined in
+  # size)) to not be classified as "false below chance"
+  # with a p-value below .05 and a probability to be correct at random of .5:
+  n_below_chance <- qbinom(.05, size=size, prob=.5, lower.tail=TRUE)
+  
+  # fill data frame 
+  learnerlist[i,1] <- file
+  learnerlist[i,2] <- ifelse(n_correct <= n_below_chance, 1, 0)
+  learnerlist[i,3] <- n_correct
+  learnerlist[i,4] <- n_below_chance
+  
+}
+
+# name columns
+names(learnerlist) <- c("filename", "below_chance", "n_correct", "n_below_chance")
+
+sum(learnerlist$below_chance) # no participant performed in any condition significantly below chance
+
+# aggregate accuracy data (average separately for block, condition, id)
+behav_aggregated <- aggregate(V6 ~ block + condition + id, data=behav, FUN = "mean")
+```
+
+## Repeated-measures ANOVA for accuracy data
+
+### Prepare variables and check distribution
+
+``` {r}
+data_anova <- behav_aggregated
+
+# factorize indepenten variables/make sure that dependent variable is numeric
+data_anova$feedback_timing <- as.factor(data_anova$condition) # independent variable I
+data_anova$block <- as.factor(data_anova$block) # independent variable II
+data_anova$id <- as.factor(data_anova$id) # subject identifier
+data_anova$accuracy <- as.numeric(data_anova$V6) # dependent variable
+
+# plot distribution
+qqnorm(data_anova$accuracy, pch = 1, frame = FALSE)
+qqline(data_anova$accuracy, col = "steelblue", lwd = 2)
+```
+
+### Conduct rmANOVA
+
+``` {r}
+res.aov <- anova_test(
+  data = data_anova, dv = accuracy, wid = id,
+  within = c(block, feedback_timing)
+)
+get_anova_table(res.aov, correction="auto")
+
+# Grenhouse-Geisser correction is automatically applied to only within-subjects 
+# factors violating the shericity assumption (i.e. Mauchly's test p-value 
+# significant (<.05))
+
+#posthoc: pairwise comparison of accuracies between blocks
+pwc <- data_anova %>%
+  pairwise_t_test(
+    accuracy ~ block, paired = TRUE,
+    p.adjust.method = "bonferroni"
+  )
+pwc
+```
+
+### Create accuracy plot
+
+``` {r}
+data_anova$value_plot <- as.numeric(data_anova$accuracy)*100 # transform to percent
+
+# subset data
+plot_short <- subset(data_anova, condition=="short")
+plot_long <- subset(data_anova, condition=="long")
+
+# open a plot device
+png("plots/accuracyplot.png", width=4, height=3, unit="in", res=2400)
+
+# set plot parameters
+par(mfcol=c(1,2), mai=c(.7,.5,.3,.1), mgp=c(1.7,.4,0), tcl=-.25)
+
+# plot data/axes/annotations
+plot(plot_short$block, plot_short$value_plot, type="l", ylim=c(0,100),
+     ylab="% correct", xlab = "Block", #main="Immediate Feedback",
+     axes=F, col ="#bdecb6", boxcol= NA) #bdecb6
+axis(1, at=c(1,2,3))
+axis(2, las=1)
+text(1.63, 115, "Immediate Feedback", xpd=T, cex=1.2)
+
+plot(plot_long$block, plot_long$value_plot, type="l", ylim=c(0,100),
+     ylab=NA, xlab = "Block", #main = "Delayed Feedback",
+     axes=F, col ="#bdecb6", boxcol= NA)
+axis(1, at=c(1,2,3))
+axis(2, las=1)
+text(1.55, 114, "Delayed Feedback", xpd=T, cex=1.2)
+
+# close plot
+dev.off()
+```
+![](plots/accuracyplot.png)
+
+# Estimated Learning Rates
+
+## Prepare variables and check distribution
+``` {r}
+
+# read data
+parameter <- read.csv("data/PE/learning_parameter_five_confirmation_agency.csv")
+
+# code id variable from filenames
+parameter$id <- substr(parameter$filename, 1, 6)
+
+# Create column for delay-condition (very specific for these filenames: combine
+# filename logic with set number, i.e. here: order of characters l and s in
+# filename indicates what 1 or 2 as set order means):
+
+for (i in 1: length(unique(parameter$filename))) {
+
+  filename <- unique(parameter$filename)[i]
+  set <- substr(filename, nchar(filename), nchar(filename))
+  orderls <- grep("ls", filename) # orderls is empty if the string "ls" doesn't occur in filename
+  if (length(orderls)==0) {
+    if (set == "1") {condition <- "short"} # if "ls" cannot  be found in filename, the order is sl (1st set = short)
+    else {condition <- "long"} # (2nd set = long)
+  } else { # (if orderls is not empty)
+    if (set == "1") {condition <- "long"} # and vice versa when "ls" can be found in filename (1st set = long)
+    else {condition <- "short"} # (2nd set = short)
+  }
+  parameter[which(parameter$filename == filename), "condition"] <- condition
+}
+
+# show descriptive statistics for parameters of rl model
+psych::describeBy(parameter[,c("alpha_con","alpha_dis","beta")], group=parameter$condition)
+
+## reduce data:
+parameter <- parameter[,c(3,4,6,7)]
+
+# and reshape
+data_learning_rates <- reshape2::melt(parameter, id = c("id", "condition"))
+data_learning_rates$learning_rate <- as.numeric(data_learning_rates$value)
+
+# plot learning rates by feedback timing and feedback type
+png("plots/learning_rates.png", width=4, height=3, unit="in", res=2400) #large enough
+## mfcol: multiple plots, mai: plot margins, bottom/left/top/right, tcl: tick mark length
+par(mfcol=c(1,2), mai=c(.7,.5,.3,.1), mgp=c(1.7,0.4,0), tcl=-.25)
+
+
+
+plot(data_learning_rates[which(data_learning_rates$condition == "short"), "variable"], data_learning_rates[which(data_learning_rates$condition == "short"), "learning_rate"], type="l", ylim=c(0,1),
+     ylab="estimated learning rates", xlab = "Feedback Type", #main="Immediate Feedback",
+     axes=F, col ="#bdecb6", boxcol= NA) #bdecb6
+axis(1, at=c(1,2), labels=c("Positive", "Negative"), cex.axis=.85)
+axis(2, las=1)
+text(1.3, 1.15, "Immediate Feedback", xpd=T, cex=1.2)
+
+plot(data_learning_rates[which(data_learning_rates$condition == "long"), "variable"], data_learning_rates[which(data_learning_rates$condition == "long"), "learning_rate"], type="l", ylim=c(0,1),
+     ylab=NA, xlab = "Feedback Type", #main = "Delayed Feedback",
+     axes=F, col ="#bdecb6", boxcol= NA)
+axis(1, at=c(1,2), labels=c("Positive", "Negative"), cex.axis=.85)
+axis(2, las=1)
+# Annotations
+text(1.3, 1.14, "Delayed Feedback", xpd=T, cex=1.2)
+dev.off()
+
+# Plot distribution
+qqnorm(data_learning_rates$learning_rate, pch = 1, frame = FALSE)
+qqline(data_learning_rates$learning_rate, col = "steelblue", lwd = 2)
+```
+![](plots/learning_rates.png)
+
+### Examine distribution in more detail
+``` {r}
+hist(data_learning_rates$learning_rate)
+plot(density(data_learning_rates$learning_rate))
+```
+
+
+
+
+### Try to transform to get an approximately normal distribution:
+
+``` {r}
+## log
+data_learning_rates$learning_rate_log <- log(data_learning_rates$learning_rate)
+
+# Plot distribution
+qqnorm(data_learning_rates$learning_rate_log, pch = 1, frame = FALSE)
+qqline(data_learning_rates$learning_rate_log, col = "steelblue", lwd = 2)
+hist(data_learning_rates$learning_rate_log)
+plot(density(data_learning_rates$learning_rate_log))
+
+
+## sqrt
+data_learning_rates$learning_rate_sqrt <- sqrt(data_learning_rates$learning_rate)
+
+# Plot distribution
+qqnorm(data_learning_rates$learning_rate_sqrt, pch = 1, frame = FALSE)
+qqline(data_learning_rates$learning_rate_sqrt, col = "steelblue", lwd = 2)
+hist(data_learning_rates$learning_rate_sqrt)
+plot(density(data_learning_rates$learning_rate_sqrt))
+
+```
+
+Not satisfactory, therefore, we will conduct wilcoxon signed-rank tests.
+
+## Wilcoxon signed-rank tests
+
+``` {r}
+data_learning_rates$feedback_timing <- as.factor(data_learning_rates$condition)
+data_learning_rates$feedback_type <- as.factor(data_learning_rates$variable)
+data_learning_rates$id <- as.factor(data_learning_rates$id)
+data_learning_rates$learning_rate <- as.numeric(data_learning_rates$value)
+
+# learning rates are very small but should not equal zero for the wilcoxon signed-rank test, check for this:
+sum(data_learning_rates$learning_rate==0) # no zeros
+
+# Compare distribution of learning rates for positive vs. negative Feedback
+wilcox.test(data_learning_rates$learning_rate ~ data_learning_rates$feedback_type,
+            paired = TRUE, alternative = "two.sided", conf.int = TRUE, exact=TRUE, mu=0)
+# to get standaardsised teststatistic (z)
+wilcoxsign_test( data_learning_rates[which(data_learning_rates$feedback_type=="alpha_con"),"learning_rate"]
+                 ~ data_learning_rates[which(data_learning_rates$feedback_type=="alpha_dis"),"learning_rate"] , data= data_learning_rates, paired = TRUE, exact=TRUE,
+                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")
+# to calculate effect size r
+wilcoxsign_test( data_learning_rates[which(data_learning_rates$feedback_type=="alpha_con"),"learning_rate"]
+                 ~ data_learning_rates[which(data_learning_rates$feedback_type=="alpha_dis"),"learning_rate"] , data= data_learning_rates, paired = TRUE, exact=TRUE,
+                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")@statistic@standardizedlinearstatistic/sqrt(20)
+
+
+# medians
+descriptive <- psych::describeBy(data_learning_rates[,"learning_rate"], group=data_learning_rates$feedback_type)
+
+round(descriptive$alpha_con$median,2)
+round(descriptive$alpha_dis$median,2)
+
+
+# Compare distribution of learning rates for immediate vs. delayed Feedback
+wilcox.test(data_learning_rates$learning_rate ~ data_learning_rates$feedback_timing,
+            paired = TRUE, alternative = "two.sided", conf.int = TRUE, exact=TRUE, mu=0)
+# to get standaardsised teststatistic (z)
+wilcoxsign_test( data_learning_rates[which(data_learning_rates$feedback_timing=="short"),"learning_rate"]
+                 ~ data_learning_rates[which(data_learning_rates$feedback_timing=="long"),"learning_rate"] , data= data_learning_rates, paired = TRUE, exact=TRUE,
+                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")
+# to calculate effect size r
+wilcoxsign_test(data_learning_rates[which(data_learning_rates$feedback_timing=="short"),"learning_rate"]
+                 ~ data_learning_rates[which(data_learning_rates$feedback_timing=="long"),"learning_rate"] , data= data_learning_rates, paired = TRUE, exact=TRUE,
+                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")@statistic@standardizedlinearstatistic/sqrt(20)
+
+# medians
+descriptive <- psych::describeBy(data_learning_rates[,"learning_rate"], group=data_learning_rates$feedback_timing)
+
+round(descriptive$long$median,2)
+round(descriptive$short$median,2)
+
+## Alternative approach: Compare difference (between learning rate for positive
+## and negative feedback) between immediate and delayed feedback:
+parameter$posminusneg <- parameter$alpha_con - parameter$alpha_dis
+
+plot(density(parameter[which(parameter$condition=="short"),"posminusneg"]), col="red", xlim=c(-1,1), ylim=c(0,5))
+lines(density(parameter[which(parameter$condition=="long"),"posminusneg"]))
+
+## Red is immediate, black is delayed FB.
+
+parameter$feedback_timing <- as.factor(parameter$condition)
+parameter$posminusneg <- as.numeric(parameter$posminusneg)
+
+# Difference between learning rates is not significantly different in the
+# immediate compared to the delayed feedback timing condition:
+wilcox.test(parameter$posminusneg ~ parameter$feedback_timing,
+            paired = TRUE, alternative = "two.sided", conf.int = TRUE, exact=TRUE, mu=0)
+# to get standaardsised teststatistic (z)
+wilcoxsign_test( parameter[which(parameter$condition=="short"),"posminusneg"] ~ parameter[which(parameter$condition=="long"),"posminusneg"], data= data_learning_rates, paired = TRUE, exact=TRUE,                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")
+# to calculate effect size r
+wilcoxsign_test( parameter[which(parameter$condition=="short"),"posminusneg"] ~ parameter[which(parameter$condition=="long"),"posminusneg"], data= data_learning_rates, paired = TRUE, exact=TRUE,                 alternative = "two.sided", detailed=TRUE, conf.int = TRUE, mu=0, zero.method="Wilcoxon",
+                 distribution="exact")@statistic@standardizedlinearstatistic/sqrt(20)
+
+# medians
+descriptive <- psych::describeBy(parameter[,"posminusneg"], group=parameter$condition)
+
+round(descriptive$long$median,2)
+round(descriptive$short$median,2)
+```
+
+# Stimulus Value Estimates
+``` {r}
+# Plot stimulus value estimates
+
+# read data
+pe_data <- read.csv("data/PE/results_five_confirmation_agency_clean.csv")
+
+# Save condition (very specific for this data: combine filename logic with set
+# number, i.e. here: order of characters l and s in filename indicates what 1
+# or 2 as set order means)
+
+for (i in 1: length(unique(pe_data$filename))) {
+
+  filename <- unique(pe_data$filename)[i]
+  set <- substr(filename, nchar(filename), nchar(filename))
+  orderls <- grep("ls", filename) # orderls is empty if the string "ls" doesn't occur in filename
+  if (length(orderls)==0) {
+    if (set == "1") {condition <- "short"} # if "ls" cannot  be found in filename, the order is sl (1st set = short)
+    else {condition <- "long"} # (2nd set = long)
+  } else { # (if orderls is not empty)
+    if (set == "1") {condition <- "long"} # and vice versa when "ls" can be found in filename (1st set = long)
+    else {condition <- "short"} # (2nd set = short)
+  }
+  pe_data[which(pe_data$filename == filename), "condition"] <- condition
+}
+
+pe_data$id <- substr(pe_data$filename, 1, 6)
+
+##### Set up axes & define function for expectationplots ####
+
+# Set up axes
+
+# save number of possible total trials of one data set for x-axis:
+ntrials <- nrow(subset(pe_data, filename==unique(pe_data$filename)[1]))
+xaxis <- seq(1, ntrials) # x-axis
+yaxis <- c(0,1) # y-axis (here: for expectation/action values ranging between 0 and zero)
+
+# Define function
+expectationplot <- function(x, ylim=yaxis, cols=viridis_pal()(5),
+                            xlab="Trial", ylab=NA, ...) {
+
+  ## set up an empty plot canvas
+  plot(1, type="l", col=NA, xlim=range(xaxis), ylim=yaxis, axes=FALSE,
+       xlab=xlab, ylab=ylab)
+
+  axis(1) # x-axis
+
+  lines(xaxis, x$Q1, col=cols[1], lwd=2)
+  lines(xaxis, x$Q2, col=cols[2], lwd=2)
+  lines(xaxis, x$Q3, col=cols[3], lwd=2)
+  lines(xaxis, x$Q4, col=cols[4], lwd=2)
+  lines(xaxis, x$Q5, col=cols[5], lwd=2)
+
+  ## axis with labels, pos=0: at origin, las=2: horizontal labels
+  axis(2, at=seq(yaxis[1],yaxis[2], 0.2), pos=0, las=2)
+  ## small intermediate axis ticks
+  axis(2, at=0:1, pos=0, labels=NA, tcl=par("tcl")/2)
+
+
+}
+
+##### Subsample data of conditions and average Qs ####
+
+### Immediate Feedback
+
+# Subset data
+data_short <- subset(pe_data, pe_data$condition=="short")
+
+# Create empty data frame with 5 columns and 200 rows
+short_q <- data.frame(matrix(0, ncol = 5, nrow = 300))
+
+# Loop through the five stimuli and create averages of reward expectations
+for (i in 1:5){
+  stim <- paste0("Q",i)
+  data_q_temp <- data_short[, stim] # subset column for stimulus
+  data_q_temp <- as.data.frame(split(data_q_temp, 1:ntrials)) # split in trials
+  # columns: trials, rows: single subjects
+  data_q_temp <- colMeans(data_q_temp, na.rm=T) #average
+  short_q[,i] <- data_q_temp # insert in empty data frame column i
+  colnames(short_q)[i] <- stim # name column
+}
+
+### Delayed feedback
+
+# Subset data
+data_long <- subset(pe_data, pe_data$condition=="long")
+
+# Create empty data frame with 5 columns and 200 rows
+long_q <- data.frame(matrix(0, ncol = 5, nrow = 300))
+
+# Loop through the five stimuli and create averages of reward expectations
+for (i in 1:5){
+  stim <- paste0("Q",i)
+  data_q_temp <- data_long[, stim] # subset column for stimulus
+  data_q_temp <- as.data.frame(split(data_q_temp, 1:ntrials)) # split in trials
+  # columns: trials, rows: single subjects
+  data_q_temp <- colMeans(data_q_temp, na.rm=T) #average
+  long_q[,i] <- data_q_temp # insert in empty data frame column i
+  colnames(long_q)[i] <- stim # name column
+}
+
+
+#### Create plot ####
+# open a plot device
+png("plots/expectationplots.png", width=7, height=3, unit="in", res=2400) #large enough
+
+par(mfcol=c(1,2), mai=c(1,.7,.3,.1), mgp=c(1.3,.4,0), tcl=-.25)
+
+# MD short (upleft)
+expectationplot(short_q, ylab="stimulus value estimates")
+# insert dashed lines for programmed reward-probability
+lines(x=c(0,300), y=c(0,0), col=viridis_pal()(5)[1], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.2,0.2), col=viridis_pal()(5)[2], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.4,0.4), col=viridis_pal()(5)[3], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.6,0.6), col=viridis_pal()(5)[4], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.8,0.8), col=viridis_pal()(5)[5], lty=2, lwd=1)
+
+text(150, 1.15, "Immediate Feedback", xpd=T, cex=1.2)
+text(175, -.505, "Reward Probability of Stimuli", xpd=T, cex=1)
+
+# Delayed feedback
+expectationplot(long_q)
+
+# Dashed lines for programmed probabilities
+lines(x=c(0,300), y=c(0,0), col=viridis_pal()(5)[1], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.2,0.2), col=viridis_pal()(5)[2], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.4,0.4), col=viridis_pal()(5)[3], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.6,0.6), col=viridis_pal()(5)[4], lty=2, lwd=1)
+lines(x=c(0,300), y=c(0.8,0.8), col=viridis_pal()(5)[5], lty=2, lwd=1)
+
+# Annotations
+text(150, 1.15, "Delayed Feedback", xpd=T, cex=1.2)
+
+# Legend
+legend(-100, -.365, c(" 0 %", "20 %", "40 %", "60 %", "80 %"),
+       col=viridis_pal()(5), pch=19, bty="n", xpd=T,
+       x.intersp=.7, ncol=5) # with default ncol=1, legend is vertical
+dev.off()
+
+
+```
+![](plots/expectationplots.png)
+
+# EEG Data Analysis
+
+## Read data and quantify ERP components
+
+```{r}
+eegdatafolder <- "data/EEG/Raw Data EEG/Export" # folder with single-trial .dat and .vmrk files
+
+#### Define custom functions to extract peak latencies and amplitudes at these latencies ####
+# Define function to extract peak latencies (03/2023)
+peak_latency <- function (tempdata, samplepoints, electrode, start, end, polarity, peak_type = "local", peak_n = "extrema", span = 7, split=FALSE) {
+  
+  # depending on data structure: prepare data
+  if (split==FALSE){
+    averagedata <- tempdata[,electrode] # take data from electrode of interest
+    y <- as.data.frame(split(averagedata, 1:samplepoints)) # split trials in rows
+  } else {
+    # subset columns of electrode of interest
+    y <- tempdata[,which(substr(names(tempdata),1,2)==substr(electrode,1,2))]
+  }
+  average <- colMeans(y, na.rm=T) # average over all trials
+  
+  # Search for local peaks (default):
+  if (peak_type == "local") {
+    
+    localpeak <- data.frame() # create empty dataframe to collect all local peaks
+    j=0 # initialize peak counter
+    
+    half_span <- span %/% 2 # take half of span (default of span: 7)
+    
+    #for (i in (half_span+1):(length(start:end)-half_span)){
+    for (i in 1:(length(start:end)-1)){
+      
+      latency <- (start:end)[i]
+      if (polarity == "pos") {
+        if (average[latency] == max(average[(latency - half_span):(latency + half_span)])) {
+          
+          # logic: if the amplitude at the current evaluated latency is the maximum of
+          # its neighbouring elements, save it as a peak (with default value of span = 7,
+          # neighbouring elements evaluated are the three elements before and after the
+          # current evaluated latency))
+          
+          # average[latency-3] < average[latency] & average[latency] > average[latency+3]) {
+          
+          j = j + 1 # peak counter  
+          localpeak[j, 1] <- latency # save latency of local peak
+          localpeak[j, 2] <- average[latency] # save amplitude
+        }
+      }
+      if (polarity == "neg") {
+        if (average[latency] == min(average[(latency - half_span):(latency + half_span)])) {
+          #if (average[latency-3] > average[latency] & average[latency] < average[latency+3]) {
+          j = j + 1 # peak counter  
+          localpeak[j, 1] <- latency # save latency of local peak
+          localpeak[j, 2] <- average[latency] # save amplitude
+        }
+      }
+    }    
+    
+    if (length(localpeak) != 0) { # if one or more local peaks have been detected:
+      # save latency of local peak with maximal (for polarity = pos) or minimal
+      # (for polarity = neg) amplitude (default = extrema):
+      if (polarity == "pos") {peak <- localpeak[which(localpeak[,2] == max(localpeak[,2])),1]}
+      if (polarity == "neg") {peak <- localpeak[which(localpeak[,2] == min(localpeak[,2])),1]}
+      
+      # alternative: when peak_n is defined otherwise, save latency of peak at position peak_n
+      if (peak_n != "extrema" & peak_n == "last") {peak <- localpeak[nrow(localpeak),1]} # if it has been defined as "last"
+      else if (peak_n != "extrema" & peak_n != "last") {peak <- localpeak[peak_n,1]} # if it contains a specific number
+      # if no local peaks or a specific (by peak_n defined) peak does not exist, "peak" contains NA
+    } else {print(paste0("No local peaks detected; getting global peaks between ", start, " and ", end, "."))} # print info to console
+    
+    
+    # Search for global peaks (if specified or if no local peak has been detected):
+    if (peak_type == "global" & polarity == "pos" | peak_type == "local" & polarity == "pos" & length(localpeak) == 0) {
+      peak <- which(average == max(average[start:end])) # global: maximal amplitude in timewindow
+    }
+    
+    if (peak_type == "global" & polarity == "neg" | peak_type == "local" & polarity == "neg" & length(localpeak) == 0) {
+      peak <- which(average == min(average[start:end])) # global: minimal amplitude in timewindow
+    }
+    
+    
+  }
+  return(peak)
+}
+
+# Define function to extract amplitudes at peak latencies (03/2023)
+peak_amplitude <- function (tempdata, samplepoints, electrode, latency, type = "single", length.average=50, split=FALSE) {
+  
+  # depending on data structure: prepare data
+  if (split==FALSE){
+    averagedata <- tempdata[,electrode] # take data from electrode of interest
+    y <- as.data.frame(split(averagedata, 1:samplepoints)) # split trials in rows
+  } else {
+    # subset columns of electrode of interest
+    y <- tempdata[,which(substr(names(tempdata),1,2)==substr(electrode,1,2))]
+  }
+  
+  
+  if (type == "single"){
+    peak_amp <- y[,latency]
+  } else
+    if (type=="mean"){
+      peak_amp <- rowMeans(y[,((latency-(length.average/2)):(latency+(length.average/2)))], na.rm=T) 
+    }
+  return(peak_amp)
+}
+
+##### Read eeg and marker data & and apply functions to quantify components #####
+
+# List all files with specified pattern in folder "Export" and save them as list "datfiles"
+datfiles <- list.files(eegdatafolder, pattern = "_SegmentationAll.dat")
+
+# Apply the following to each entry of list "datfiles"
+erp_data <- lapply(datfiles, function(x) {
+  
+  ### Collect basic data from current filename x (eeg-export filename)
+  
+  # save subject code
+  id <- substr(x, 1, 6) # first six characters of eeg-export-filename
+  
+  # save filename (from eeg raw data)
+  filename <- gsub("_SegmentationAll.dat", "", x)
+  # saves from x everything before "_SegmentationAll.dat" in variable "filename"
+  
+  # save set (first or second)
+  set <- substr(filename, nchar(filename), nchar(filename))
+  # here: last number of eeg raw data file indicates which set (in order) it is
+  
+  # save condition (very specific for this data: combine filename logic with set
+  # number, i.e. here: order of characters l and s in filename indicates what 1
+  # or 2 as set order means)
+  orderls <- grep("ls", filename) # orderls is empty if the string "ls" doesn't occur in filename
+  if (length(orderls)==0) {
+    if (set == "1") {condition <- "short"} # if "ls" cannot  be found in filename, the order is sl (1st set = short)
+    else {condition <- "long"} # (2nd set = long)
+  } else { # (if orderls is not empty)
+    if (set == "1") {condition <- "long"} # and vice versa when "ls" can be found in filename (1st set = long)
+    else {condition <- "short"} # (2nd set = short)
+  }
+  
+  ### Read markerfile
+  
+  # In order to find respective markerfile:
+  mrkname <- sub(".dat$",".vmrk",x) # replace ".dat" at the end ($) with .vmrk
+  file <- paste0(eegdatafolder, "/", mrkname, collapse="") # paste full path+filename for .vmrk
+  mrk <- readLines(file) # read markerfile
+  
+  # Find number of comment lines above marker info
+  skip <- grep("Mk1", mrk)[1]-1 # grep() finds string in file (here:mrk) & returns number of first line with [1]
+  mrk <- read.csv(file,skip=skip,header=FALSE) # use skip option to skip comment lines
+  
+  # Get Marker
+  stim <- mrk[grep("Mk[0-9]+=Stimulus",mrk[,1]),] # stim <- mrk but only lines with Stimulus (in Index: find Mk + number + = Stimulus in erster Spalte vom mrk)
+  stim <- sub("S","",stim[,2]) # substitutes "S" with empty string i second column
+  stim <- as.numeric(stim)
+  stim <- subset(stim, stim<191) # delete markers above 190 (which are no feedbackmarkers but may occur in segments)
+  
+  ### Read the respective datfile & apply above defined functions peak_latency()
+  ### and peak_amplitude()
+  
+  dat <- read.delim(paste0(eegdatafolder, "/", x, collapse=""), header=T, sep = " ", dec = ",")
+  dat <- as.data.frame(apply(dat, 2, as.numeric))# in case R classifies variables otherwise
+  
+  ## FRN
+  
+  # in order to get subsamples of trials with positive and negative feedback
+  # (to create difference wave), we directly append stim markers
+  
+  stim_rep <- rep(stim, each = 1000) # replicate each marker a 1000 times (which is the number of samplepoints per trial)
+  dat$stim <- stim_rep # to append it to the eeg data which has for each samplepoint a new row (1000 rows = 1 trial)
+  
+  dat_pos <- dat[which(dat$stim>100),]
+  dat_neg <- dat[which(dat$stim<100),]
+  # dat_pos and dat_neg are subsamples of dat that include only rows which have
+  # higher or lower values than 100 in variable "stim" (eeg-markers which codes
+  # programmed reward probability of the chosen stimulus and valence of the
+  # received feedback)
+  
+  # filename is printed to the console, so that it is clear to which file a
+  # potential warning (that no local peak is detected, see below) belongs
+  # print(filename) # commented out for Markdown file (anonymization)
+  
+  # for peak from difference wave
+  samplepoints <- 1000
+  average_pos <- dat_pos[,"FCz"] # take data from electrode of interest
+  y <- as.data.frame(split(average_pos, 1:samplepoints)) # split trials in rows
+  average_pos <- colMeans(y) # average over all trials
+  
+  average_neg <- dat_neg[,"FCz"] # take data from electrode of interest
+  y <- as.data.frame(split(average_neg, 1:samplepoints)) # split trials in rows
+  average_neg <- colMeans(y) # average over all trials
+  
+  diff_wave <- average_neg - average_pos
+  diff_wave <- as.data.frame(diff_wave)
+  colnames(diff_wave) <- "FCz"
+
+  max_frn_fcz_diff <- peak_latency(diff_wave, 1000, "FCz", 380, 550, "neg", "local") # FCz
+  frn_fcz_diffwave_av <- peak_amplitude(dat, 1000, "FCz", max_frn_fcz_diff, "mean", length.average=60)
+  
+  ## P300
+
+  # I: Find positive local peaks in average (separate for condition
+  # (automatically because of separate dat files), valence and electrodes) in
+  # 300-500 post-feedback time window
+  
+  # for subsample of trials with positive fb (tempdata = dat_pos):
+  
+  p300_pz_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "Pz", start = 500, end = 700, polarity = "pos", peak_type = "local", peak_n = "extrema")
+  p300_fcz_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "FCz", start = 500, end = 700, polarity = "pos", peak_type = "local", peak_n = "extrema")
+  
+  # for subsample of trials with negative fb (tempdata = dat_neg):
+  p300_pz_neg <- peak_latency(tempdata = dat_neg, samplepoints = 1000,
+                              electrode = "Pz", start = 500, end = 700, polarity = "pos", peak_type = "local", peak_n = "extrema")
+  p300_fcz_neg <- peak_latency(tempdata = dat_neg, samplepoints = 1000,
+                               electrode = "FCz", start = 500, end = 700, polarity = "pos", peak_type = "local", peak_n = "extrema")
+  
+  # II: Extract single-trial amplitudes for identified latencies
+  
+  # for subsample of trials with positive fb:
+  
+  # pz
+
+  p300_pz_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                    electrode = "Pz", latency = p300_pz_pos,
+                                    type = "mean", length.average=60)
+  # fcz
+  
+  p300_fcz_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                    electrode = "FCz", latency = p300_fcz_pos,
+                                    type = "mean", length.average=60)
+
+ 
+  # for subsample of trials with negative fb:
+  
+  # pz
+  
+  p300_pz_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                    electrode = "Pz", latency = p300_pz_neg,
+                                    type = "mean", length.average=60)
+  # fcz
+  
+  p300_fcz_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                     electrode = "FCz", latency = p300_fcz_neg,
+                                     type = "mean", length.average=60)
+  
+  # IV: Bring identified difference amplitudes in correct trial order
+  
+  # bind single-trial amplitudes retrieved from separate peak detections for
+  # trials with positive and negative feedback together again
+  
+  # pz
+  
+  p300_pz_valence <- rep(NA, length(stim))
+  p300_pz_valence[which(stim>100)] <- p300_pz_pos_amp # insert vector from pos trials with stim-which index at correct positions
+  p300_pz_valence[which(stim<100)] <- p300_pz_neg_amp # insert vector from neg trials with stim-which index at correct positions
+  
+  # fcz
+  
+  p300_fcz_valence <- rep(NA, length(stim))
+  p300_fcz_valence[which(stim>100)] <- p300_fcz_pos_amp # insert vector from pos trials with stim-which index at correct positions
+  p300_fcz_valence[which(stim<100)] <- p300_fcz_neg_amp # insert vector from neg trials with stim-which index at correct positions
+  
+  
+  ## N170
+
+  # I: Find negative local peak in average (separate for condition
+  # (automatically because of separate dat files), valence and electrodes) in
+  # 130-235 post-feedback time window
+  
+  # for subsample of trials with positive fb (tempdata = dat_pos):
+  min_n170_p7_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                electrode = "P7", start = 330, end = 435, polarity = "neg", peak_type = "local", peak_n = "extrema")
+  min_n170_p8_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                electrode = "P8", start = 330, end = 435, polarity = "neg", peak_type = "local", peak_n = "extrema")
+  
+  # for subsample of trials with negative fb (tempdata = dat_neg):
+  min_n170_p7_neg <- peak_latency(tempdata = dat_neg, samplepoints = 1000,
+                electrode = "P7", start = 330, end = 435, polarity = "neg", peak_type = "local", peak_n = "extrema")
+  min_n170_p8_neg <- peak_latency(tempdata = dat_neg, samplepoints = 1000,
+                electrode = "P8", start = 330, end = 435, polarity = "neg", peak_type = "local", peak_n = "extrema")
+  
+  # II: Find preceding positive local peak (again separately for condition
+  # (automatically because of separate dat files), valence and electrodes)
+  # in post-feedback time window ranging from 80 ms to the latency of the
+  # identified positive peak
+  
+  # for subsample of trials with positive fb (tempdata = dat_pos, end =
+  # min_n170_p7_pos and min_n170_p8_pos respectively):
+  max_n170_p7_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "P7", start = 280, end = min_n170_p7_pos, polarity = "pos",
+                                  peak_type = "local", peak_n = "extrema")
+  max_n170_p8_pos <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "P8", start = 280, end = min_n170_p8_pos, polarity = "pos",
+                                  peak_type = "local", peak_n = "extrema")
+  
+  # for subsample of trials with negative fb (tempdata = dat_neg, end =
+  # min_n170_p7_neg and min_n170_p8_neg):
+  max_n170_p7_neg <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "P7", start = 280, end = min_n170_p7_neg, polarity = "pos",
+                                  peak_type = "local", peak_n = "extrema")
+  max_n170_p8_neg <- peak_latency(tempdata = dat_pos, samplepoints = 1000,
+                                  electrode = "P8", start = 280, end = min_n170_p8_neg, polarity = "pos",
+                                  peak_type = "local", peak_n = "extrema")
+  
+  
+  # III: Extract single-trial amplitudes for identified latencies and calculate
+  # difference
+  
+  # for subsample of trials with positive fb:
+  
+  # p7
+  min_n170_p7_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                        electrode = "P7", latency = min_n170_p7_pos, type = "single") # min
+  max_n170_p7_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                        electrode = "P7", latency = max_n170_p7_pos, type = "single") # max
+  n170_p7_pos <- min_n170_p7_pos_amp - max_n170_p7_pos_amp# calculate difference
+  
+  # p8
+  min_n170_p8_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                        electrode = "P8", latency = min_n170_p8_pos, type = "single") # min
+  max_n170_p8_pos_amp <- peak_amplitude(tempdata = dat_pos, samplepoints = 1000,
+                                        electrode = "P8", latency = max_n170_p8_pos, type = "single") # max
+  n170_p8_pos <- min_n170_p8_pos_amp - max_n170_p8_pos_amp # calculate difference
+  
+  
+  # for subsample of trials with negative fb:
+  
+  # p7
+  min_n170_p7_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                        electrode = "P7", latency = min_n170_p7_neg, type = "single") # min
+  max_n170_p7_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                        electrode = "P7", latency = max_n170_p7_neg, type = "single") # max
+  n170_p7_neg <- min_n170_p7_neg_amp - max_n170_p7_neg_amp # calculate difference
+  
+  # p8
+  min_n170_p8_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                        electrode = "P8", latency = min_n170_p8_neg, type = "single") # min
+  max_n170_p8_neg_amp <- peak_amplitude(tempdata = dat_neg, samplepoints = 1000,
+                                        electrode = "P8", latency = max_n170_p8_neg, type = "single") # max
+  n170_p8_neg <- min_n170_p8_neg_amp - max_n170_p8_neg_amp # calculate difference
+  
+  
+  # IV: Bring identified difference amplitudes in correct trial order
+  
+  # bind single-trial amplitudes retrieved from separate peak detections for
+  # trials with positive and negative feedback together again
+  
+  # p7
+  n170_p7_p2p <- rep(NA, length(stim)) # create NA vector of length stim/no of trials
+  n170_p7_p2p[which(stim>100)] <- n170_p7_pos # insert vector from pos trials with stim-which index at correct positions
+  n170_p7_p2p[which(stim<100)] <- n170_p7_neg # insert vector from neg trials with stim-which index at correct positions
+  
+  # p8
+  n170_p8_p2p <- rep(NA, length(stim)) # create NA vector of length stim/no of trials
+  n170_p8_p2p[which(stim>100)] <- n170_p8_pos # insert vector from pos trials with stim-which index at correct positions
+  n170_p8_p2p[which(stim<100)] <- n170_p8_neg # insert vector from neg trials with stim-which index at correct positions
+  
+ 
+  ### Return everything that should be saved in the resulting dataframe
+  
+  return(cbind.data.frame(id, filename, set, condition, stim, 
+                          frn_fcz_diffwave_av, p300_fcz_valence, p300_pz_valence,
+                          n170_p7_p2p, n170_p8_p2p))
+  
+})
+
+data <- do.call(rbind.data.frame, erp_data)
+
+# data is a dataframe of single-trial amplitudes for each data file (with called
+# arguments in peak_latency() and peak_amplitude()-function) and their respective
+# stimulus markers
+
+# Further data wrangling to match EEG with behavioural/PE data
+
+#### Add trial number (not the final but to prevent resorting/ enable checking that) 
+
+trial <- c() # create empty vector
+
+for (i in 1:length(unique(data$filename))) {
+  
+  # build vector of ascending numbers from 1 to number of total rows the current filename has in data
+  trial_temp <- c(1:nrow(data[which(data$filename == unique(data$filename)[i]),]))
+  trial <- c(trial, trial_temp) # deliver it to trial vector
+  
+}
+
+data$trial <- trial # append trial vector to data
+
+# write.csv(data, "data.csv") ## to save data in between 
+
+##### Insert empty rows for trials which were rejected during Artifact Scan in BVA #####
+
+## To match the trial-level EEG data with trial-by-trial PE, we need to add
+## empty rows for all trials that are not included in the exported EEG data
+
+# List removed segments from artifact rejection I
+art1 <- readLines(paste0(eegdatafolder, "/", "Report_Artifact Rejection.txt"))
+seglist <- list()
+j=1 # start counter
+for (i in 1:length(datfiles)) {
+  filename <- art1[grep("History File:", art1)[i]+1]
+  id <- substr(filename, 1,6) # first six characters of line
+  set <- substr(filename, nchar(filename), nchar(filename)) # last character
+  
+  startseg <- grep("The following segments have been removed:", art1)[i]+1
+  endseg <- grep("Artifact Type", art1)[j]-6
+  seg <- art1[startseg:endseg]
+  seg <- as.numeric(unlist(strsplit(seg, split=", ")))
+  
+  seglist[[i]] <- cbind(id, set, seg)
+  
+  j=j+2
+  # add 2 to counter (to grep the correct line in which the string "Artifact
+  # Type" occurs the second time for the current subject; in contrast to the
+  # strings "History File" and "... have been removed:", "Artifact Type" occurs
+  # 2 times in every subject report, therefore, the separate counter)
+  
+}
+
+# List removed segments from artifact rejection 2
+art2 <- readLines(paste0(eegdatafolder, "/", "Report_Artifact Rejection 2.txt"))
+seglist2 <- list()
+j=1
+for (i in 1:length(datfiles)) {
+  filename <- art2[grep("History File:", art2)[i]+1]
+  id <- substr(filename, 1,6) # first six characters of line
+  set <- substr(filename, nchar(filename), nchar(filename)) # last character
+  
+  startseg <- grep("The following segments have been removed:", art2)[i]+1
+  endseg <- grep("Artifact Type", art2)[j]-6
+  seg <- art2[startseg:endseg]
+  seg <- as.numeric(unlist(strsplit(seg, split=", ")))
+  
+  seglist2[[i]] <- cbind(id, set, seg)
+  j=j+2
+}
+#seglist2 # returns list; and with seglist2[[3]] third entry (i.e. third vp in art2 file)
+
+
+## Define function to add empty rows for removed segments
+insertRows <- function (dataframe, newrows, index) {
+  temp <- dataframe
+  for (i in 1:nrow(newrows)){
+    
+    if (index[i]+i-1 == nrow(temp)+1 ) {
+      temp <- rbind(temp, newrows[i,])
+      # special case when index is last row which does not exist yet
+    } else {
+      temp <- as.data.frame(temp,stringsAsFactors=FALSE)
+      # inserts empty row at position i of index
+      temp[seq(index[i] + i,nrow(temp)+1),] <- temp[seq(index[i] + i - 1,nrow(temp)),]
+      temp[index[i] + i - 1,] <- newrows[i,]
+    }
+  }
+  
+  return(temp)
+}
+
+
+# Add removed segments from Artifact Rejection 2
+# (at first from the second artifact rejection to recreate initial order since
+# these were the last segments that have been removed and segment numbers refer
+# to the number of segments the data had when it entered artifact rejection)
+
+columnsno <- ncol(data)
+insertdata <- data.frame() # New data frame
+for (i in 1:length(seglist2)) {
+  x <- seglist2[[i]]
+  if (length(x) > 2) {
+    nnewrows <- nrow(x) # number new rows
+    rows <- matrix(NA, ncol=columnsno, nrow=nnewrows)
+    rows[,which(colnames(data)=="id")] <- x[,"id"]
+    rows[,which(colnames(data)=="set")] <- x[,"set"]
+    
+    temp <- subset(subset(data, id==unique(x[,"id"])), set==unique(x[,"set"]))
+    index <- as.numeric(x[,"seg"])
+    index <- sort(index)
+    index <- index - 0:(length(index)-1)
+    tempdata <- insertRows(temp, rows, index)
+    insertdata <- rbind(insertdata, tempdata)
+    
+    id <- x[1,"id"]
+    set <- x[1,"set"]
+    #print(paste0(nnewrows, " rows added to data of ", id, " in set ", set)) # not used bc of anonymization
+  } else insertdata <- rbind(insertdata, subset(subset(data, id==x[,"id"]), set ==x[,"set"]))
+}
+
+data <- insertdata
+
+# Add removed segments from Artifact Rejection 1
+columnsno <- ncol(data)
+insertdata <- data.frame() # New data frame
+
+for (i in 1:length(seglist)) {
+  x <- seglist[[i]]
+  if (length(x) > 2) {
+    nnewrows <- nrow(x) # number new rows
+    rows <- matrix(NA, ncol=columnsno, nrow=nnewrows)
+    rows[,which(colnames(data)=="id")] <- x[,"id"]
+    rows[,which(colnames(data)=="set")] <- x[,"set"]
+    
+    temp <- subset(subset(data, id==unique(x[,"id"])), set==unique(x[,"set"]))
+    index <- as.numeric(x[,"seg"])
+    index <- sort(index)
+    index <- index - 0:(length(index)-1)
+    tempdata <- insertRows(temp, rows, index)
+    insertdata <- rbind(insertdata, tempdata)
+    
+    id <- x[1,"id"]
+    set <- x[1,"set"]
+    #print(paste0(nnewrows, " rows added to data of ", id, " in set ", set)) # not used bc of anonymization
+  } else insertdata <- rbind(insertdata, subset(subset(data, id==x[,"id"]), set ==x[,"set"]))
+}
+data <- insertdata
+
+##### Insert empty rows for trials in which no feedback occured #####
+# (which we can read from pe_data where at these rows are also NAs)
+
+# read pe_data
+pe_data <- read.csv("data/PE/results_five_confirmation_agency_clean.csv")
+
+# Create list (seglist) with rownumbers which have NAs in pe_data
+seglist <- list()
+for (i in 1:length(unique(pe_data$filename))) {
+  
+  x <- subset(pe_data, filename==unique(pe_data$filename)[i])
+  filename <- unique(pe_data$filename)[i]
+  id <- substr(filename, 1,6)
+  set <- data$set[which(data$filename==filename)]
+  set <- as.numeric(set)[1]
+  seg <- which(is.na(x$PE_c))
+  seglist[[i]] <- cbind(id, set, seg)
+  
+}
+
+# in case you start this code in between: you have to load the functions again
+# to insert rows (insertRows, see above)
+
+# Add empty rows for trials in which no feedback occured (listed in seglist)
+columnsno <- ncol(data)
+insertdata <- data.frame() # New data frame
+for (i in 1:length(seglist)) {
+  x <- seglist[[i]]
+  if (length(x) > 2) {
+    nnewrows <- nrow(x) # number new rows
+    rows <- matrix(NA, ncol=columnsno, nrow=nnewrows)
+    rows[,which(colnames(data)=="id")] <- x[,"id"]
+    rows[,which(colnames(data)=="set")] <- x[,"set"]
+    
+    temp <- subset(subset(data, id==unique(x[,"id"])), set==unique(x[,"set"]))
+    index <- as.numeric(x[,"seg"])
+    index <- index - 0:(length(index)-1)
+    tempdata <- insertRows(temp, rows, index)
+    insertdata <- rbind(insertdata, tempdata)
+    
+    id <- x[1,"id"]
+    set <- x[1,"set"]
+    #print(paste0(nnewrows, " rows added to data of ", id, " in set ", set)) # not used bc of anonymization
+  } else insertdata <- rbind(insertdata, subset(subset(data, id==x[,"id"]), set ==x[,"set"]))
+}
+data <- insertdata
+
+# you can use the following command to check whether the data is complete:
+# list number of observation (including missings) separate for id and set
+#table(data$id, data$set) # ok, cool # not used bc of anonymization
+
+
+##### Check whether intial order of trials was preserved #####
+
+for (i in 1:length(unique(data$filename))) {
+  
+  x <- data[which(data$filename == unique(data$filename)[i]), ]
+  print(any(as.numeric(x[,"trial"])!=order(as.numeric(x[,"trial"]))))
+  # print true if the order of trial deviates from the same vector when ordered
+  # by the function order() // i.e. if only FALSE appears, everthing's ok
+  
+} # ok, cool
+
+
+##### Check whether trials were matched properly when inserting NAs #####
+
+# read behavioural data
+behav <- read.csv("data/behav_clean.csv", sep=",", header=T)
+colnames(behav)[1] <- "filename" # name first column ("filename")
+
+# reconstruct stimulus markers from behavioural data:
+library(dplyr) # for na_if() and recode ()
+behav$stim <- dplyr::na_if(behav$V7, 9) # recode NAs in behavioural data (coded as 9)
+behav$stim <- dplyr::recode(behav$stim, '1'=1, '2'=22, '3'=43, '4'=64, '5'=85) # marker for stim 1-5 (neg fb)
+behav$stim_check <- ifelse(behav$V9==1, behav$stim + 105, ifelse(behav$V9==0, behav$stim, NA)) # if pos fb stim +105
+
+# reduce data
+behavcheck <- behav[,c("filename","stim_check")]
+datacheck <- data[,c("filename","stim", "id", "set")]
+
+# loop through all separate files in data
+stimcheck <- data.frame() # create empty dataframe
+for (i in 1:sum(!is.na(unique(data$filename)))){
+  
+  x <- unique(data$filename[which(!is.na(data$filename))])[i] # current file
+  id_x <- substr(x, 1, 6) # current id
+  set_x = data[which(data$filename==x & data$id==id_x)[1], "set"] # current set
+  
+  # create new column with filenames (because of NAs in existing filename column
+  # in rows which were inserted above (these rows have only "id" and "set")
+  datacheck[which(datacheck$id==id_x & datacheck$set==set_x), "filenamefull"] <- rep(datacheck[which(datacheck$id==id_x & datacheck$set==set_x & !is.na(datacheck$filename))[1], "filename"],300)
+  
+  tempstim <- c() # create empty temporal variable
+  # bind and insert columns with filename and stim from datacheck (eeg data) and
+  # column with stim from behavcheck (behavioural data) in temporal variable
+  tempstim <- cbind(datacheck[which(datacheck$filenamefull==x), "filenamefull"],
+                    datacheck[which(datacheck$filenamefull==x), "stim"],
+                    behavcheck[which(behavcheck$filename==x), "stim_check"])
+  
+  stimcheck <- rbind(stimcheck, tempstim) # append rows to dataframe
+}
+
+# compare column from eeg and behav data (show number of non-matching markers)
+sum(stimcheck[,"V2"] != stimcheck[,"V3"], na.rm=T) # zero, top!
+
+# Merge PE and EEG data
+
+##### Merge pe- and eeg-data #####
+
+library(plyr) # to use join() (merging data while preserving row order (merge() does that not...))
+
+# prepare both datasets by adding a column with trial count so that they can be
+# merged and corresponding trials are matched:
+pe_data$trial <- rep(1:300, 40)
+data$trial <- rep(1:300, 40) # initial variable "trial" (for order check, see above) is overwritten
+
+data <- join(pe_data, data, by = c("filename", "trial"))
+
+#### Calculate demographics ####
+demographics <- read.csv("data/demographics_behav_active.csv", sep=";")
+names(demographics)[1] <- "id"
+table(demographics$gender)
+mean(demographics$age)
+sd(demographics$age)
+```
+
+## Prepare data for mixed models
+
+``` {r}
+# ensure that outcome variables are classified as numeric
+
+data$frn_fcz_diffwave_av <- as.numeric(data$frn_fcz_diffwave_av)
+
+data$p300_fcz <- as.numeric(data$p300_fcz_valence)
+data$p300_pz <- as.numeric(data$p300_pz_valence)
+
+data$n170_p7_p2p <- as.numeric(data$n170_p7_p2p)
+data$n170_p8_p2p <- as.numeric(data$n170_p8_p2p)
+
+# Code numerical variables for effect estimates in mixed model
+
+# delay effect (short as -1, long as 1)
+data$delay <- ifelse(data$condition=="short", -1, ifelse(data$condition=="long", 1, NA))
+
+# create pe_unsigned variable and feedback valence variable
+data$pe_unsigned <- abs(data$PE_c)
+data$pe_unsigned_zero <- data$pe_unsigned - 0.5 # shift around zero
+# -0.5 corresponds to "fully expected", 0.5 to completely unexpected
+
+data$valence <- ifelse(data$PE_c > 0, -1, ifelse(data$PE_c < 1, 1, NA))
+# - 1 is positive, 1 is negative feedback
+
+# to do manual follow-up analyses for interactions with delay: create dummy
+# variable for delay
+data$delay.short <- ifelse(data$condition=="short", 0, ifelse(data$condition=="long", 1, NA))
+data$delay.long <- ifelse(data$condition=="long", 0, ifelse(data$condition=="short", 1, NA))
+```
+
+## FRN/RewP
+
+``` {r}
+#### Analysis: FRNdiff - full data (i.e. both Feedback Timing conditions) ####
+
+## "Using 'buildmer' to automatically find & compare maximal (mixed) models"
+## https://cran.r-project.org/web/packages/buildmer/vignettes/buildmer.html
+
+library(buildmer)
+
+# Save formula of maximal model
+maximalmodel <- frn_fcz_diffwave_av ~ delay*pe_unsigned_zero*valence+ (1 + delay*pe_unsigned_zero*valence|id)
+
+# Find largest model that still converges with buildmer()
+m <- buildmer(maximalmodel, data = data, buildmerControl=buildmerControl(direction='order',ddf='Satterthwaite',                                                            args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(m)
+
+(f <- formula(m@model)) # formula of maximal feasible model
+
+# Try stepwise elimination to find a more parsimoniuous model (default criterion: LRT)
+parsimonious_m <- buildmer(f, data = data, buildmerControl=list(direction='backward',ddf='Satterthwaite',
+                                                                      args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(parsimonious_m)
+
+(parsimonious_m_formula <- formula(parsimonious_m@model))
+
+```
+
+### Resolve interactions
+
+``` {r}
+# Fit model again to use probe_interaction()
+frn_diff_parsimoniuous <- lmer(parsimonious_m_formula,
+                               data = data, REML=T,
+                               control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+summary(frn_diff_parsimoniuous)
+
+# Resolve interaction between delay and valence:
+frn_diff_parsimoniuous_interactions_1 <- interactions::probe_interaction(frn_diff_parsimoniuous, pred = delay, modx = valence)
+frn_diff_parsimoniuous_interactions_2 <- interactions::probe_interaction(frn_diff_parsimoniuous, pred = valence, modx = delay)
+
+# Resolve interaction between prediction error and valence:
+frn_diff_parsimoniuous_interactions_3 <- interactions::probe_interaction(frn_diff_parsimoniuous, pred = pe_unsigned_zero, modx = valence)
+frn_diff_parsimoniuous_interactions_4 <- interactions::probe_interaction(frn_diff_parsimoniuous, pred = valence, modx = pe_unsigned_zero)
+
+frn_diff_parsimoniuous_interactions_1
+frn_diff_parsimoniuous_interactions_2
+frn_diff_parsimoniuous_interactions_3
+frn_diff_parsimoniuous_interactions_4
+```
+
+### Plot interaction between Valence & Delay
+
+``` {r}
+
+#### Plot Delay x Valence interaction ####
+library(ggeffects)
+library(ggplot2)
+library("RColorBrewer")
+
+# fit again with factorized predictors
+data_factor <- data
+
+# Factorize predictors and rename levels for axes and legend
+data_factor$delay <- as.factor(data_factor$delay)
+data_factor$Valence <- as.factor(data_factor$valence) # capitalize
+levels(data_factor$delay) <- c("Immediate", "Delayed")
+levels(data_factor$Valence) <- c("Positive", "Negative")
+
+frn_diff_parsimoniuous_factor <- lmer(frn_fcz_diffwave_av ~ 1 + delay + Valence +
+                                        pe_unsigned_zero + delay:Valence    +  Valence:pe_unsigned_zero + 
+                                         (1 + delay + Valence + delay:Valence |      id),
+                                      data = data_factor, REML=T,
+                                      control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+summary(frn_diff_parsimoniuous_factor)
+
+plotdata <- ggeffect(frn_diff_parsimoniuous_factor, terms = c("delay", "Valence"), ci.lvl = 0.95, se=T)
+
+plotdata
+
+png(filename = paste0("plots/FRNdiff_valence_delay.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Feedback Timing") + # + scale_colour_brewer(palette="Blues")
+  ylim(9.5, 0) + scale_color_manual(values = c( "blue", "green3")) +
+  scale_fill_manual(values = c("blue", "green3"))
+dev.off()
+```
+![](plots/FRNdiff_valence_delay.png)
+
+### Plot interaction between Prediction Error & Valence
+
+``` {r}
+
+#### Plot Prediction Error x Valence interaction ####
+library(ggeffects)
+
+# fit again with factorized predictors
+
+plotdata <- ggeffect(frn_diff_parsimoniuous_factor, terms = c("pe_unsigned_zero [-.5:.5]", "Valence"))
+plotdata
+
+png(filename = paste0("plots/FRNdiff_valence_prediction_error.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <-
+  plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color='Valence') +
+  ylim(9.5, 0) + scale_color_manual(values = c("blue", "green3")) +
+  scale_fill_manual(values = c("blue", "green3")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00"))
+
+dev.off()
+```
+![](plots/FRNdiff_valence_prediction_error.png)
+
+### Separate analyses for immediate and delayed data
+
+``` {r}
+#### Repeat the same separate models for immediate and delayed data ####
+data_short <- subset(data, data$condition=="short")
+data_long <- subset(data, data$condition=="long")
+
+## "Using 'buildmer' to automatically find & compare maximal (mixed) models"
+## https://cran.r-project.org/web/packages/buildmer/vignettes/buildmer.html
+
+library(buildmer)
+
+# Save formula of maximal model (now without delay bc separate analyses)
+maximalmodel <- frn_fcz_diffwave_av ~ pe_unsigned_zero*valence + (1 + pe_unsigned_zero*valence|id)
+
+```
+
+#### Immediate feedback
+
+``` {r}
+### Immediate FB-data
+
+# Find largest model that still converges with buildmer()
+m_short <- buildmer(maximalmodel, data = data_short, buildmerControl=buildmerControl(direction='order',ddf='Satterthwaite',
+           args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(m_short)
+
+(f_short <- formula(m_short@model)) # formula of maximal feasible model
+
+# Try stepwise elimination to find a more parsimoniuous model (default criterion: LRT)
+parsimonious_m_short <- buildmer(f_short, data = data_short, buildmerControl=list(direction='backward',ddf='Satterthwaite',
+                                                                                  args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(parsimonious_m_short)
+
+frn_diff_parsimonious_immediate <- parsimonious_m_short
+
+```
+
+##### Resolve interactions
+
+``` {r}
+# Resolve interaction between valence and prediction error:
+
+# Define model again with lmer because probe_interaction does not want to take a buildmer object
+frn_diff_parsimonious_immediate <- lmer(f_short, REML=T, data = data_short,
+                                        control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+summary(frn_diff_parsimonious_immediate)
+
+
+frn_diff_parsimonious_immediate_interaction_pe_valence_1 <- interactions::probe_interaction(frn_diff_parsimonious_immediate, pred = pe_unsigned_zero , modx = valence)
+
+frn_diff_parsimonious_immediate_interaction_pe_valence_2 <- interactions::probe_interaction(frn_diff_parsimonious_immediate, modx = pe_unsigned_zero , pred = valence)
+
+frn_diff_parsimonious_immediate_interaction_pe_valence_1 
+frn_diff_parsimonious_immediate_interaction_pe_valence_2
+
+# significant effect only for positive (ß=2.88, p=.00) but not negative feedback (ß=.16, p=.79)
+# the more expected the feedback is, the larger (more negative) are frn amplitudes
+```
+
+##### Plot Interaction
+
+``` {r}
+#### Only immediate data: Plot Prediction Error x Valence interaction ####
+library(ggeffects)
+
+# fit again with factorized predictors
+data_factor <- data_short
+
+# Factorize predictors and rename levels for axes and legend
+data_factor$Valence <- as.factor(data_factor$valence) # capitalize
+levels(data_factor$Valence) <- c("Positive", "Negative")
+
+frn_diff_parsimoniuous_factor <- lmer(frn_fcz_diffwave_av ~ 1 + Valence + pe_unsigned_zero + Valence:pe_unsigned_zero +      (1 + Valence | id),
+                                      data = data_factor, REML=T,
+                                      control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+summary(frn_diff_parsimoniuous_factor)
+
+plotdata <- ggeffect(frn_diff_parsimoniuous_factor, terms = c("pe_unsigned_zero [-.5:.5]", "Valence"))
+plotdata
+png(filename = paste0("plots/FRNdiff_valence_prediction_error_immediate.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <-
+  plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color='Valence') +
+  scale_color_manual(values = c("blue", "green3")) +
+  ylim(9.5, 0) + 
+  scale_fill_manual(values = c("blue", "green3")) + 
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00"))
+
+dev.off()
+
+```
+![](plots/FRNdiff_valence_prediction_error_immediate.png)
+
+
+#### Delayed Feedback
+
+
+``` {r}
+# separate analysis for data of delayed feedback condition
+
+# Find largest model that still converges with buildmer()
+m_long <- buildmer(maximalmodel, data = data_long, buildmerControl=buildmerControl(direction='order',ddf='Satterthwaite',
+                                                                                   args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(m_long)
+
+(f_long <- formula(m_long@model)) # formula of maximal feasible model can also be retrieved with this line
+
+# Try stepwise elimination to find a more parsimoniuous model (default criterion: LRT)
+parsimonious_m_long <- buildmer(f_long, data = data_long, buildmerControl=list(direction='backward',ddf='Satterthwaite',
+                                                                               args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(parsimonious_m_long)
+
+frn_diff_parsimonious_delayed <- parsimonious_m_long
+
+(parsimonious_m_formula_long <- formula(frn_diff_parsimonious_delayed@model))
+
+```
+
+##### Resolve interactions
+
+``` {r}
+# Resolving PE x valence interaction:
+
+# Define model again with lmer because probe_interaction does not want to take a buildmer object
+frn_diff_parsimonious_delayed <- lmer( parsimonious_m_formula_long,
+                                       REML=T, data = data_long, control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+#summary(frn_diff_parsimonious_delayed)
+
+frn_diff_parsimonious_delayed_interaction_pe_valence_1 <- interactions::probe_interaction(frn_diff_parsimonious_delayed, pred = pe_unsigned_zero , modx = valence)
+frn_diff_parsimonious_delayed_interaction_pe_valence_2 <- interactions::probe_interaction(frn_diff_parsimonious_delayed, modx = pe_unsigned_zero , pred = valence)
+# effect of prediction error on frn amplitudes only for positive (ß=1.65, p=.01)
+# but not negative (ß=.06, p = .91) feedback
+# the more expected the feedback is, the larger are frn amplitudes (more negative)
+
+frn_diff_parsimonious_delayed_interaction_pe_valence_1
+frn_diff_parsimonious_delayed_interaction_pe_valence_2
+
+
+```
+
+##### Plot interaction between Valence & PE
+
+``` {r}
+#### Only delayed data: Plot Prediction Error x Valence interaction ####
+library(ggeffects)
+
+
+# fit again with factorized predictors
+data_factor <- data_long
+
+# Factorize predictors and rename levels for axes and legend
+#data_factor$delay <- as.factor(data_factor$delay)
+data_factor$Valence <- as.factor(data_factor$valence) # capitalize
+#levels(data_factor$delay) <- c("Immediate", "Delayed")
+levels(data_factor$Valence) <- c("Positive", "Negative")
+
+frn_diff_parsimoniuous_factor <- lmer(frn_fcz_diffwave_av ~ 1 + Valence + pe_unsigned_zero +      Valence:pe_unsigned_zero + (1 | id),
+                                      data = data_factor, REML=T,
+                                      control = lmerControl(optimizer="bobyqa", optCtr = list(maxfun = 1e9)))
+summary(frn_diff_parsimoniuous_factor)
+
+
+#plotdata <- ggpredict(frn_diff_parsimoniuous_factor, terms = c("delay", "Valence"))
+plotdata <- ggeffect(frn_diff_parsimoniuous_factor, terms = c("pe_unsigned_zero [-.5:.5]", "Valence"))
+plotdata
+png(filename = paste0("plots/FRNdiff_valence_prediction_error_delayed.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <-
+  plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color='Valence') +
+  ylim(9.5, 0)+ scale_color_manual(values = c("blue", "green3")) +
+  scale_fill_manual(values = c("blue", "green3")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00"))
+
+dev.off()
+
+```
+![](plots/FRNdiff_valence_prediction_error_delayed.png)
+
+
+## P300
+
+``` {r}
+################################################################################
+#### Analysis: P300 - full data ####
+# "Melt" data so that values of Pz and FCz are in separate rows
+library(reshape2) # for melt
+library(tidyr) # for separate
+library(buildmer)
+data_p300 <- melt(data, id = colnames(data)[-c(which(colnames(data)=="p300_fcz"),which(colnames(data)=="p300_pz"))])
+data_p300 <- separate(data_p300, "variable", c("component", "electrode"), "_")
+
+# code variable for effect of electrode
+data_p300$electrode_f <- ifelse(data_p300$electrode=="fcz", 1, -1)
+
+# Save formula of maximal model
+maximalmodel <- value ~ delay*valence*pe_unsigned_zero*electrode_f +
+  (1+delay*pe_unsigned_zero*valence|id) + (1|electrode_f)
+
+# Find largest model that still converges with buildmer()
+m <- buildmer(maximalmodel, data = data_p300, buildmerControl=buildmerControl(direction='order',ddf='Satterthwaite',
+                                                                                    args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(m)
+
+(f <- formula(m@model)) # formula of maximal feasible model can also be retrieved with this line
+
+# Try stepwise elimination to find a more parsimoniuous model (default criterion: LRT)
+parsimonious_m <- buildmer(f, data = data_p300, buildmerControl=list(direction='backward',ddf='Satterthwaite',
+                                                                           args=list(control=lmerControl(optimizer='bobyqa'))))
+
+
+summary(parsimonious_m)
+
+(parsimonious_p300 <- formula(parsimonious_m@model))
+
+p300_model <- lmer(parsimonious_p300, data=data_p300, REML=T,
+                    control=lmerControl(optimizer='bobyqa'))
+summary(p300_model)
+
+```
+
+### Resolve interactions
+
+#### Interaction between Delay & Electrode
+
+##### Effect of Electrode for immediate Feedback
+
+``` {r}
+#### Manually ####
+# Retrieve formula of parsimonious P300 model:
+# parsimonious_p300
+# value ~ 1 + delay + pe_unsigned_zero + delay:pe_unsigned_zero + 
+#   electrode_f + delay:electrode_f + pe_unsigned_zero:electrode_f + 
+#   valence + pe_unsigned_zero:valence + delay:valence + electrode_f:valence + 
+#   delay:electrode_f:valence + (1 + delay + valence | id)
+
+# Replace delay with delay.short and delay.long:
+
+formula_short <- value ~ 1 + delay.short + pe_unsigned_zero + delay.short:pe_unsigned_zero +
+  electrode_f + delay.short:electrode_f + pe_unsigned_zero:electrode_f +
+  valence + pe_unsigned_zero:valence + delay.short:valence + electrode_f:valence +
+  delay.short:electrode_f:valence + (1 + delay.short + valence | id)
+
+formula_long <- value ~ 1 + delay.long + pe_unsigned_zero + delay.long:pe_unsigned_zero +
+  electrode_f + delay.long:electrode_f + pe_unsigned_zero:electrode_f +
+  valence + pe_unsigned_zero:valence + delay.long:valence + electrode_f:valence +
+  delay.long:electrode_f:valence + (1 + delay.long + valence | id)
+
+p300_model_imm <- lmer(formula_short, data=data_p300, REML=T,
+                        control=lmerControl(optimizer='bobyqa'))
+summary(p300_model_imm)
+
+```
+
+##### Effect of Electrode for delayed Feedback
+
+``` {r}
+p300_model_del <- lmer(formula_long, data=data_p300, REML=T,
+                        control=lmerControl(optimizer='bobyqa'))
+summary(p300_model_del)
+
+```
+
+#### Interaction between Electrode x Delay x Valence
+
+``` {r}
+
+#### Resolve with probe_interactions ####
+# Delay x Electrode x Valence
+p300_model_interaction_electrode_valence_delay <- interactions::probe_interaction(p300_model, modx = valence, mod2 = delay, pred = electrode_f)
+p300_model_interaction_electrode_valence_delay
+
+```
+
+#### Interaction between PE x Valence
+
+``` {r}
+# PE x Valence
+p300_model_interaction_pe_valence <- interactions::probe_interaction(p300_model, modx= valence, pred = pe_unsigned_zero)
+p300_model_interaction_pe_valence
+```
+
+
+#### Interaction between PE x Feedback Timing
+
+``` {r}
+
+# PE x delay
+p300_model_interaction_pe_delay <- interactions::probe_interaction(p300_model, modx= delay, pred = pe_unsigned_zero)
+p300_model_interaction_pe_delay
+
+```
+
+#### Interaction between PE x Electrode
+
+``` {r}
+#### Two-way interactions with PE ####
+
+# Electrode x PE
+p300_model_interaction_pe_electrode <- interactions::probe_interaction(p300_model, modx= electrode_f, pred = pe_unsigned_zero)
+p300_model_interaction_pe_electrode
+
+```
+
+### Plot interactions
+
+``` {r}
+
+#### Fit factorized model for plots ####
+library(ggeffects)
+library(ggplot2)
+library("RColorBrewer")
+
+
+# fit again with factorized predictors
+data_factor <- data_p300
+
+# Factorize predictors and rename levels for axes and legend
+data_factor$delay <- as.factor(data_factor$delay)
+data_factor$valence <- as.factor(data_factor$valence) # capitalize
+levels(data_factor$delay) <- c("Immediate", "Delayed")
+levels(data_factor$valence) <- c("Positive", "Negative")
+data_factor$electrode_f <- as.factor(data_factor$electrode_f)
+levels(data_factor$electrode_f) <- c("Pz", "FCz")
+
+p300_model <- lmer(parsimonious_p300, data=data_factor, REML=T,
+                    control=lmerControl(optimizer='bobyqa'))
+summary(p300_model)
+
+
+#### Plot Electrode x PE interaction ####
+plotdata <- ggeffect(p300_model, terms = c("pe_unsigned_zero [-.5:.5]", "electrode_f"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_prediction_error_electrode.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color="Electrode") + # + scale_colour_brewer(palette="Blues")
+  ylim(8, 1) +  scale_color_manual(values = c( "yellow2", "magenta")) +
+  scale_fill_manual(values = c("yellow2", "magenta")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00"))# +
+ # theme(legend.position="none")
+dev.off()
+
+```
+![](plots/P300_prediction_error_electrode.png)
+
+
+``` {r}
+
+#### Plot Delay x PE interaction ####
+plotdata <- ggeffect(p300_model, terms = c("pe_unsigned_zero [-.5:.5]", "delay"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_prediction_error_delay.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color="Electrode") + # + scale_colour_brewer(palette="Blues")
+  ylim(8, 1) +  scale_color_manual(values = c( "cyan2", "purple2")) +
+  scale_fill_manual(values = c("cyan2", "purple2")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00")) #+
+  #theme(legend.position="none")
+dev.off()
+```
+![](plots/P300_prediction_error_delay.png)
+
+
+``` {r}
+##### Plot legend for delay ####
+## plotted with different type of legend as before, therefore I plot something different only for the legend
+
+plotdata <- ggeffect(p300_model, terms = c("electrode_f", "delay"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_delay_legend.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Feedback Timing", color="Feedback Timing") + # + scale_colour_brewer(palette="Blues")
+  ylim(7, 2) +  scale_color_manual(values = c( "cyan2", "purple2"), aesthetics = c("colour", "fill"),
+                                   guide = guide_legend(override.aes = list(
+                                     linetype = c("blank", "blank"),
+                                     shape = c(16,16)), reverse = F))#, breaks=c("Immediate", "Delayed"))
+
+
+dev.off()
+
+
+##### Plot legend for electrode ####
+## plotted without legends, therefore plot something different for a legend
+
+plotdata <- ggeffect(p300_model, terms = c("delay", "electrode_f"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_electrode_legend.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Electrode", color="Electrode") + # + scale_colour_brewer(palette="Blues")
+  ylim(7, 2) +  scale_color_manual(values = c( "yellow2", "magenta"), aesthetics = c("colour", "fill"),
+                                   guide = guide_legend(override.aes = list(
+                                     linetype = c("blank", "blank"),
+                                     shape = c(16,16)), reverse = T))
+
+
+dev.off()
+
+#### Plot Valence x PE interaction ####
+plotdata <- ggeffect(p300_model, terms = c("pe_unsigned_zero [-.5:.5]", "valence"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_prediction_error_valence.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color="Electrode") + # + scale_colour_brewer(palette="Blues")
+  ylim(8, 1) + scale_color_manual(values = c( "blue", "green3")) +
+  scale_fill_manual(values = c("blue", "green3")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00")) #+
+  #theme(legend.position="none")
+dev.off()
+
+```
+![](plots/P300_prediction_error_valence.png)
+
+
+``` {r}
+
+##### Plot legend for Valence ####
+## plotted without legends, therefore plot something different for a legend
+
+plotdata <- ggeffect(p300_model, terms = c("delay", "valence"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_valence_legend.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color="Valence") + # + scale_colour_brewer(palette="Blues")
+  ylim(7, 2) +  scale_color_manual(values = c( "blue", "green3"), aesthetics = c("colour", "fill"),
+                                   guide = guide_legend(override.aes = list(
+                                     linetype = c("blank", "blank"),
+                                     shape = c(16,16)), reverse = T))
+
+
+dev.off()
+### Plot Delay x Valence x Electrode interaction ####
+plotdata <- ggeffect(p300_model, terms = c( "electrode_f", "valence","delay"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/P300_delay_valence_electrode.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() + scale_x_reverse(breaks=c(1,2) ,
+                                           labels = c( "Pz", "FCz"))+
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs( x="Electrode", color="Valence") + # + scale_colour_brewer(palette="Blues")
+  ylim(8, 1) + scale_color_manual(values = c( "blue", "green3")) +
+  scale_fill_manual(values = c("blue", "green3"))+
+  #scale_x_discrete()
+  #scale_x_continuous) +
+  #theme(legend.position="none")+
+  theme(strip.text.x = element_blank())
+dev.off()
+
+
+```
+![](plots/P300_delay_valence_electrode.png)
+
+
+## N170
+
+``` {r}
+# Prepare data
+
+# "Melt" data so that values of P7 and P8 are in separate rows
+library(reshape2) # for melt
+library(tidyr) # for separate
+
+data_n170 <- reshape2::melt(data, id = colnames(data)[-c(which(colnames(data)=="n170_p7_p2p"),
+                                                   which(colnames(data)=="n170_p8_p2p"))])
+data_n170$variable <- substr(data_n170$variable, 1, 7) # delete "_p2p"
+data_n170 <- tidyr::separate(data_n170, "variable", c("component", "electrode"), "_")
+
+# code variable for electrode effect
+data_n170$hemisphere <- ifelse(data_n170$electrode=="p7", -1, 1)
+
+# to do manual follow-up analyses for interaction with electrode: create dummy
+# variable for electrode
+data_n170$hemisphere.p7 <- ifelse(data_n170$hemisphere==-1, 0, ifelse(data_n170$hemisphere==1, 1, NA))
+data_n170$hemisphere.p8 <- ifelse(data_n170$hemisphere==1, 0, ifelse(data_n170$hemisphere==-1, 1, NA))
+
+# to do manual follow-up analyses for interaction with valence: create dummy
+# variable for valence
+data_n170$valence.pos <- ifelse(data_n170$valence==-1, 0, ifelse(data_n170$valence==1, 1, NA))
+data_n170$valence.neg <- ifelse(data_n170$valence==1, 0, ifelse(data_n170$valence==-1, 1, NA))
+
+# Save formula of maximal model
+maximalmodel <- value ~ delay*valence*pe_unsigned_zero*hemisphere +
+  (1+delay*pe_unsigned_zero*valence|id) + (1|hemisphere)
+library(buildmer)
+# Find largest model that still converges with buildmer()
+m <- buildmer(maximalmodel, data = data_n170, buildmerControl=buildmerControl(direction='order',ddf='Satterthwaite',
+                                                                                    args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(m)
+
+(f <- formula(m@model)) # formula of maximal feasible model can also be retrieved with this line
+
+# Try stepwise elimination to find a more parsimoniuous model (default criterion: LRT)
+parsimonious_m <- buildmer(f, data = data_n170, buildmerControl=list(direction='backward',ddf='Satterthwaite',
+                                                                           args=list(control=lmerControl(optimizer='bobyqa'))))
+summary(parsimonious_m)
+
+(parsimonious_n170 <- formula(parsimonious_m@model))
+
+model_n170 <- lmer(parsimonious_n170,
+                   REML=TRUE, data = data_n170, control=lmerControl(optimizer='bobyqa'))
+summary(model_n170)
+```
+
+### Resolve interactions
+
+``` {r}
+
+#### Resolve interactions with probe_interaction ####
+
+
+# Interaction Hemisphere, Valence and Prediction Error
+model_n170_hemisphere_valence_pe <- interactions::probe_interaction(model_n170, modx = hemisphere , pred = pe_unsigned_zero, mod2=valence)
+model_n170_hemisphere_valence_pe
+
+
+# Interaction Hemisphere x Delay
+model_n170_hemisphere_delay <- interactions::probe_interaction(model_n170, pred = hemisphere , modx = delay)
+model_n170_hemisphere_delay
+
+```
+
+### Plot interactions
+
+``` {r}
+
+
+#### fit again with factorized predictors ####
+data_factor <- data_n170
+
+# Factorize predictors and rename levels for axes and legend
+data_factor$delay <- as.factor(data_factor$delay)
+data_factor$valence <- as.factor(data_factor$valence) # capitalize
+levels(data_factor$delay) <- c("Immediate", "Delayed")
+levels(data_factor$valence) <- c("Positive", "Negative")
+data_factor$hemisphere <- as.factor(data_factor$hemisphere)
+levels(data_factor$hemisphere) <- c("P7", "P8")
+
+model_n170 <- lmer(parsimonious_n170,
+                   REML=TRUE, data = data_factor, control=lmerControl(optimizer='bobyqa'))
+summary(model_n170)
+
+#### Plot delay x hemisphere ####
+
+library(ggeffects)
+library(ggplot2)
+
+plotdata <- ggeffect(model_n170, terms = c("delay", "hemisphere"), ci.lvl = 0.95)
+plotdata
+
+# I: plot with legend
+png(filename = paste0("plots/N170_delay_hemisphere.png"),width=3, height=4, unit="in", res=400) # 12, 4
+
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Feedback Timing", color="Hemisphere") + # + scale_colour_brewer(palette="Blues")
+  ylim(-4, -12) + # scale_color_manual(values = c( "cadetblue", "darkblue")) +
+  scale_fill_manual(values = c( "cadetblue", "forestgreen")) +
+  scale_color_manual(values =  c( "cadetblue", "forestgreen"), aesthetics = c("colour", "fill"),
+                     guide = guide_legend(override.aes = list(
+                       linetype = c("blank", "blank"),
+                       shape = c(16,16)), reverse = F))
+
+dev.off()
+
+```
+![](plots/N170_delay_hemisphere.png)
+
+
+``` {r}
+# II: plot the same without legend
+
+png(filename = paste0("plots/N170_delay_hemisphere_without_legend.png"),width=3, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() + 
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(color="black"),#, face="bold"),
+    axis.ticks = element_line(color = "black")
+  ) + labs(x = "Feedback Timing", color="Hemisphere") + # + scale_colour_brewer(palette="Blues")
+  ylim(-4, -12) +  #scale_color_manual(values = c( "cadetblue", "darkblue")) +
+  scale_fill_manual(values = c( "cadetblue", "forestgreen")) +
+  scale_color_manual(values =  c( "cadetblue", "forestgreen"), aesthetics = c("colour", "fill"),
+                     guide = guide_legend(override.aes = list(
+                       linetype = c("blank", "blank"),
+                       shape = c(16,16)), reverse = F))+
+  theme(legend.position="none")
+
+dev.off()
+
+#### Plot Electrode x Valence x PE interaction ####
+plotdata <- ggeffect(model_n170, terms = c("pe_unsigned_zero [-.5:.5]", "valence", "hemisphere"), ci.lvl = 0.95)
+plotdata
+
+png(filename = paste0("plots/N170_prediction_error_electrode_valence.png"),width=4, height=4, unit="in", res=400) # 12, 4
+plot <- plot(plotdata, connect.lines = F, show.title = F, show.x.title = F, show.y.title = F, show.legend = T)
+plot + scale_y_reverse() +
+  theme_classic() +
+  theme(axis.text.x = element_text(color="black"),#, face="bold"),
+        axis.ticks = element_line(color = "black")
+  ) + labs(x = "Prediction Error", color="Electrode") + # + scale_colour_brewer(palette="Blues")
+  ylim(-4, -12) +  scale_color_manual(values = c( "blue", "green3")) +
+  scale_fill_manual(values = c( "blue", "green3")) +
+  scale_x_continuous(breaks=c(-.5,-.25,0, .25, .5) ,labels = c("0.00", "0.25","0.50", "0.75","1.00")) +
+  theme(legend.position="none") +
+  theme(strip.text.x = element_blank())
+dev.off()
+
+```
+
+![](plots/N170_prediction_error_electrode_valence.png)
+
+
+``` {r}
